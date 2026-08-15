@@ -52,6 +52,11 @@ hashkey = the-secret-for-session-checksums
 # If no key is specified, data will not be encrypted (not recommended).
 blockkey = -encryption-key-
 
+# Seconds to keep a session after the websocket closed before removing it.
+# Default: 30. Lower values reduce ghost participants after disconnects but
+# increase the risk of expiring sessions that are still resuming.
+# expireduration = 30
+
 [clients]
 # Shared secret for connections from internal clients. This must be the same
 # value as configured in the respective internal services.

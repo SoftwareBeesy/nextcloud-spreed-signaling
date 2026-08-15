@@ -518,10 +518,50 @@ func (r *Room) clearInCallStats() {
 }
 
 func (r *Room) addSessionToCall(session Session) bool {
+	r.evictOlderSessionsForUser(session)
+
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	return r.addSessionToCallLocked(session)
+}
+
+// evictOlderSessionsForUser closes other in-call sessions of the same authenticated
+// user in this room. Guests (empty user id) are intentionally not evicted — multiple
+// guests may legitimately coexist, and a guest with two devices is a rare valid case.
+func (r *Room) evictOlderSessionsForUser(newSession Session) {
+	userId := newSession.UserId()
+	if userId == "" {
+		return
+	}
+
+	switch newSession.ClientType() {
+	case api.HelloClientTypeInternal, api.HelloClientTypeFederation:
+		return
+	}
+
+	r.mu.Lock()
+	var toEvict []Session
+	for existing := range r.inCallSessions {
+		if existing.PublicId() == newSession.PublicId() {
+			continue
+		}
+		if existing.UserId() != userId {
+			continue
+		}
+		switch existing.ClientType() {
+		case api.HelloClientTypeInternal, api.HelloClientTypeFederation:
+			continue
+		}
+		toEvict = append(toEvict, existing)
+	}
+	r.mu.Unlock()
+
+	for _, old := range toEvict {
+		r.logger.Printf("Evicting older session %s of user %s in room %s (replaced by %s)",
+			old.PublicId(), userId, r.id, newSession.PublicId())
+		r.hub.disconnectSessionWithReason(old, "session_replaced")
+	}
 }
 
 // +checklocks:r.mu

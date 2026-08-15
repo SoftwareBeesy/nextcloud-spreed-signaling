@@ -115,8 +115,11 @@ var (
 	// Anonymous clients have to join a room after 10 seconds.
 	anonmyousJoinRoomTimeout = 10 * time.Second // +checklocksignore: Global readonly variable.
 
-	// Sessions expire 30 seconds after the connection closed.
-	sessionExpireDuration = 30 * time.Second // +checklocksignore: Global readonly variable.
+	// Sessions expire 30 seconds after the connection closed (default; override via [sessions] expireduration).
+	defaultSessionExpireDuration = 30 * time.Second // +checklocksignore: Global readonly variable.
+
+	// sessionExpireDuration is the default used by tests when no Hub instance is available.
+	sessionExpireDuration = defaultSessionExpireDuration // +checklocksignore: Global readonly variable.
 
 	// Run housekeeping jobs once per second
 	housekeepingInterval = time.Second
@@ -220,8 +223,9 @@ type Hub struct {
 	// +checklocks:mu
 	federationClients map[*FederationClient]bool
 
-	backendTimeout time.Duration
-	backend        *talk.BackendClient
+	backendTimeout        time.Duration
+	sessionExpireDuration time.Duration
+	backend               *talk.BackendClient
 
 	trustedProxies atomic.Pointer[container.IPList]
 	geoip          *geoip.Lookup
@@ -267,6 +271,13 @@ func NewHub(ctx context.Context, cfg *goconf.ConfigFile, events events.AsyncEven
 	if err != nil {
 		return nil, fmt.Errorf("error creating session id codec: %w", err)
 	}
+
+	sessionExpireSeconds, _ := cfg.GetInt("sessions", "expireduration")
+	if sessionExpireSeconds <= 0 {
+		sessionExpireSeconds = int(defaultSessionExpireDuration / time.Second)
+	}
+	sessionExpireDuration := time.Duration(sessionExpireSeconds) * time.Second
+	logger.Printf("Sessions expire %s after the connection closed", sessionExpireDuration)
 
 	internalClientsSecret, _ := config.GetStringOptionWithEnv(cfg, "clients", "internalsecret")
 	if internalClientsSecret == "" {
@@ -423,8 +434,9 @@ func NewHub(ctx context.Context, cfg *goconf.ConfigFile, events events.AsyncEven
 		federatedSessions:  make(map[*ClientSession]bool),
 		federationClients:  make(map[*FederationClient]bool),
 
-		backendTimeout: backendTimeout,
-		backend:        backend,
+		backendTimeout:        backendTimeout,
+		sessionExpireDuration: sessionExpireDuration,
+		backend:               backend,
 
 		geoip: geoipLookup,
 
@@ -1152,7 +1164,7 @@ func (h *Hub) processUnregister(client ClientWithSession) Session {
 	if session != nil {
 		delete(h.clients, session.Data().Sid)
 		now := time.Now()
-		h.expiredSessions[session] = now.Add(sessionExpireDuration)
+		h.expiredSessions[session] = now.Add(h.sessionExpireDuration)
 	}
 	h.mu.Unlock()
 	if session != nil {

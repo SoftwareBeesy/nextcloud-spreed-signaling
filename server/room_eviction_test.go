@@ -44,9 +44,10 @@ func (s *evictionTestSession) SendMessage(message *api.ServerMessage) bool { ret
 func TestRoom_SessionsToEvictForUser(t *testing.T) {
 	t.Parallel()
 	hub, asyncEvents, _, server := CreateHubForTestWithConfig(t, getTestConfig)
-	defer server.Close()
 
-	backend := hub.backend.GetBackend("default")
+	u, err := url.Parse(server.URL)
+	require.NoError(t, err)
+	backend := hub.backend.GetBackend(u)
 	require.NotNil(t, backend)
 	room, err := NewRoom("testroom", nil, hub, asyncEvents, backend)
 	require.NoError(t, err)

@@ -11,9 +11,6 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/strukturag/nextcloud-spreed-signaling/v2/api"
-	"github.com/strukturag/nextcloud-spreed-signaling/v2/events"
-	"github.com/strukturag/nextcloud-spreed-signaling/v2/log"
-	logtest "github.com/strukturag/nextcloud-spreed-signaling/v2/log/test"
 	"github.com/strukturag/nextcloud-spreed-signaling/v2/session"
 	"github.com/strukturag/nextcloud-spreed-signaling/v2/talk"
 )
@@ -46,14 +43,12 @@ func (s *evictionTestSession) SendMessage(message *api.ServerMessage) bool { ret
 
 func TestRoom_SessionsToEvictForUser(t *testing.T) {
 	t.Parallel()
-	logger := logtest.NewLoggerForTest(t)
-	ctx := log.NewLoggerContext(t.Context(), logger)
-	hub, _, _, server := CreateHubForTestWithConfig(t, getTestConfig)
+	hub, asyncEvents, _, server := CreateHubForTestWithConfig(t, getTestConfig)
 	defer server.Close()
 
 	backend := hub.backend.GetBackend("default")
 	require.NotNil(t, backend)
-	room, err := NewRoom("testroom", nil, hub, events.NewAsyncEvents(ctx), backend)
+	room, err := NewRoom("testroom", nil, hub, asyncEvents, backend)
 	require.NoError(t, err)
 
 	oldSession := &evictionTestSession{publicId: "old", userId: "alice", clientType: api.HelloClientTypeClient}

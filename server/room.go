@@ -526,21 +526,22 @@ func (r *Room) addSessionToCall(session Session) bool {
 	return r.addSessionToCallLocked(session)
 }
 
-// evictOlderSessionsForUser closes other in-call sessions of the same authenticated
-// user in this room. Guests (empty user id) are intentionally not evicted — multiple
-// guests may legitimately coexist, and a guest with two devices is a rare valid case.
-func (r *Room) evictOlderSessionsForUser(newSession Session) {
+// sessionsToEvictForUser returns in-call sessions of the same authenticated user
+// that should be replaced. Guests (empty user id) are never returned.
+func (r *Room) sessionsToEvictForUser(newSession Session) []Session {
 	userId := newSession.UserId()
 	if userId == "" {
-		return
+		return nil
 	}
 
 	switch newSession.ClientType() {
 	case api.HelloClientTypeInternal, api.HelloClientTypeFederation:
-		return
+		return nil
 	}
 
 	r.mu.Lock()
+	defer r.mu.Unlock()
+
 	var toEvict []Session
 	for existing := range r.inCallSessions {
 		if existing.PublicId() == newSession.PublicId() {
@@ -555,7 +556,15 @@ func (r *Room) evictOlderSessionsForUser(newSession Session) {
 		}
 		toEvict = append(toEvict, existing)
 	}
-	r.mu.Unlock()
+	return toEvict
+}
+
+// evictOlderSessionsForUser closes other in-call sessions of the same authenticated
+// user in this room. Guests (empty user id) are intentionally not evicted — multiple
+// guests may legitimately coexist, and a guest with two devices is a rare valid case.
+func (r *Room) evictOlderSessionsForUser(newSession Session) {
+	toEvict := r.sessionsToEvictForUser(newSession)
+	userId := newSession.UserId()
 
 	for _, old := range toEvict {
 		r.logger.Printf("Evicting older session %s of user %s in room %s (replaced by %s)",

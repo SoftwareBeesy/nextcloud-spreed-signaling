@@ -33,6 +33,8 @@ jobs:
           set -euo pipefail
           if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
             tag="${{ inputs.image_tag }}"
+          elif [[ "${GITHUB_REF_TYPE}" == "tag" && "${GITHUB_REF_NAME}" == work-talk-* ]]; then
+            tag="${GITHUB_REF_NAME#work-talk-}"
           else
             tag="${GITHUB_REF_NAME}"
           fi

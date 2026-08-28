@@ -289,14 +289,14 @@ func (r *Room) processBackendRoomRequestRoom(message *talk.BackendServerRoomRequ
 	message.Backend = r.Backend()
 	switch message.Type {
 	case "update":
-		r.hub.roomUpdated <- message
+		r.hub.sendRoomUpdated(message)
 	case "delete":
 		r.notifyInternalRoomDeleted()
-		r.hub.roomDeleted <- message
+		r.hub.sendRoomDeleted(message)
 	case "incall":
-		r.hub.roomInCall <- message
+		r.hub.sendRoomInCall(message)
 	case "participants":
-		r.hub.roomParticipants <- message
+		r.hub.sendRoomParticipants(message)
 	case "message":
 		r.publishRoomMessage(message.Message)
 	case "switchto":

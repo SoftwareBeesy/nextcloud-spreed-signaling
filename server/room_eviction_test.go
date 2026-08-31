@@ -27,6 +27,7 @@ func (s *evictionTestSession) PublicId() api.PublicSessionId         { return s.
 func (s *evictionTestSession) ClientType() api.ClientType            { return s.clientType }
 func (s *evictionTestSession) Data() *session.SessionIdData          { return nil }
 func (s *evictionTestSession) UserId() string                        { return s.userId }
+func (s *evictionTestSession) AuthUserId() string                    { return s.userId }
 func (s *evictionTestSession) UserData() json.RawMessage             { return nil }
 func (s *evictionTestSession) ParsedUserData() (api.StringMap, error) { return nil, nil }
 func (s *evictionTestSession) Backend() *talk.Backend                { return nil }
@@ -68,4 +69,62 @@ func TestRoom_SessionsToEvictForUser(t *testing.T) {
 	assert.Equal(t, api.PublicSessionId("old"), evict[0].PublicId())
 
 	assert.Empty(t, room.sessionsToEvictForUser(guestSession))
+}
+
+// guestLookupSession simulates ClientSession.UserId() resolving via GetRoomSessionData.
+type guestLookupSession struct {
+	evictionTestSession
+	room *Room
+}
+
+func (s *guestLookupSession) UserId() string {
+	if s.userId != "" {
+		return s.userId
+	}
+	if s.room != nil {
+		return s.room.GetRoomSessionData(s).UserId
+	}
+	return ""
+}
+
+func TestRoom_SessionsToEvictForUser_DoesNotDeadlockOnGuestLookup(t *testing.T) {
+	t.Parallel()
+	hub, asyncEvents, _, server := CreateHubForTestWithConfig(t, getTestConfig)
+
+	u, err := url.Parse(server.URL)
+	require.NoError(t, err)
+	backend := hub.backend.GetBackend(u)
+	require.NotNil(t, backend)
+	room, err := NewRoom("testroom", nil, hub, asyncEvents, backend)
+	require.NoError(t, err)
+
+	guestInCall := &guestLookupSession{
+		evictionTestSession: evictionTestSession{
+			publicId:   "guest",
+			userId:     "",
+			clientType: api.HelloClientTypeClient,
+		},
+		room: room,
+	}
+	room.roomSessionData[guestInCall.publicId] = &talk.RoomSessionData{UserId: "guest-actor"}
+	oldAlice := &evictionTestSession{publicId: "old", userId: "alice", clientType: api.HelloClientTypeClient}
+	newAlice := &evictionTestSession{publicId: "new", userId: "alice", clientType: api.HelloClientTypeClient}
+
+	room.mu.Lock()
+	room.inCallSessions[guestInCall] = true
+	room.inCallSessions[oldAlice] = true
+	room.mu.Unlock()
+
+	done := make(chan []Session, 1)
+	go func() {
+		done <- room.sessionsToEvictForUser(newAlice)
+	}()
+
+	select {
+	case evict := <-done:
+		require.Len(t, evict, 1)
+		assert.Equal(t, api.PublicSessionId("old"), evict[0].PublicId())
+	case <-time.After(2 * time.Second):
+		t.Fatal("sessionsToEvictForUser deadlocked with guest session in call")
+	}
 }

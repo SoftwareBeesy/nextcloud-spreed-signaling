@@ -39,6 +39,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -123,6 +124,12 @@ var (
 
 	// Run housekeeping jobs once per second
 	housekeepingInterval = time.Second
+
+	// Buffered room event channels absorb backend bursts without blocking room goroutines (ISSUE-262).
+	hubRoomEventChannelBuffer = 16
+
+	// Hub loop watchdog reports a stalled event loop after this duration without a heartbeat tick.
+	defaultHubLoopWatchdogInterval = 10 * time.Second
 
 	// Number of decoded session ids to keep.
 	decodeCacheSize = 8192
@@ -243,6 +250,17 @@ type Hub struct {
 
 	allowedCandidates atomic.Pointer[container.IPList]
 	blockedCandidates atomic.Pointer[container.IPList]
+
+	roomInCallDrops atomic.Uint64
+
+	hubLoopLastTick              atomic.Int64
+	hubLoopWatchdogTriggered     atomic.Bool
+	hubLoopWatchdogIntervalNanos atomic.Int64
+
+	hubLoopStallMu      sync.Mutex
+	hubLoopStallRelease chan struct{}
+
+	housekeepingIntervalNanos atomic.Int64
 }
 
 func NewHub(ctx context.Context, cfg *goconf.ConfigFile, events events.AsyncEvents, rpcServer *grpc.Server, rpcClients *grpc.Clients, etcdClient etcd.Client, r *mux.Router, version string) (*Hub, error) {
@@ -406,10 +424,10 @@ func NewHub(ctx context.Context, cfg *goconf.ConfigFile, events events.AsyncEven
 		closer:   internal.NewCloser(),
 		shutdown: internal.NewCloser(),
 
-		roomUpdated:      make(chan *talk.BackendServerRoomRequest),
-		roomDeleted:      make(chan *talk.BackendServerRoomRequest),
-		roomInCall:       make(chan *talk.BackendServerRoomRequest),
-		roomParticipants: make(chan *talk.BackendServerRoomRequest),
+		roomUpdated:      make(chan *talk.BackendServerRoomRequest, hubRoomEventChannelBuffer),
+		roomDeleted:      make(chan *talk.BackendServerRoomRequest, hubRoomEventChannelBuffer),
+		roomInCall:       make(chan *talk.BackendServerRoomRequest, hubRoomEventChannelBuffer),
+		roomParticipants: make(chan *talk.BackendServerRoomRequest, hubRoomEventChannelBuffer),
 
 		clients:  make(map[uint64]ClientWithSession),
 		sessions: make(map[uint64]Session),
@@ -568,12 +586,20 @@ func (h *Hub) Run() {
 	defer h.roomPing.Stop()
 	defer h.backend.Close()
 
-	housekeeping := time.NewTicker(housekeepingInterval)
+	go h.runHousekeepingLoop()
+	go h.runHubLoopWatchdog()
+	h.hubLoopLastTick.Store(time.Now().UnixNano())
+
 	federationPing := time.NewTicker(updateActiveSessionsInterval)
 	geoipUpdater := time.NewTicker(24 * time.Hour)
+	defer federationPing.Stop()
+	defer geoipUpdater.Stop()
 
 loop:
 	for {
+		h.hubLoopWaitIfStalled()
+		h.hubLoopLastTick.Store(time.Now().UnixNano())
+
 		select {
 		// Backend notifications from Nextcloud.
 		case message := <-h.roomUpdated:
@@ -584,9 +610,6 @@ loop:
 			h.processRoomInCallChanged(message)
 		case message := <-h.roomParticipants:
 			h.processRoomParticipants(message)
-		// Periodic internal housekeeping.
-		case now := <-housekeeping.C:
-			h.performHousekeeping(now)
 		case <-geoipUpdater.C:
 			go h.updateGeoDatabase()
 		case <-federationPing.C:
@@ -597,6 +620,119 @@ loop:
 	}
 	if h.geoip != nil {
 		h.geoip.Close()
+	}
+}
+
+func (h *Hub) runHousekeepingLoop() {
+	interval := h.getHousekeepingInterval()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case now := <-ticker.C:
+			h.performHousekeeping(now)
+		case <-h.closer.C:
+			return
+		}
+	}
+}
+
+func (h *Hub) getHousekeepingInterval() time.Duration {
+	if ns := h.housekeepingIntervalNanos.Load(); ns > 0 {
+		return time.Duration(ns)
+	}
+	return housekeepingInterval
+}
+
+func (h *Hub) runHubLoopWatchdog() {
+	for {
+		checkInterval := h.getHubLoopWatchdogCheckInterval()
+		select {
+		case <-time.After(checkInterval):
+			h.checkHubLoopWatchdog()
+		case <-h.closer.C:
+			return
+		}
+	}
+}
+
+func (h *Hub) getHubLoopWatchdogStallThreshold() time.Duration {
+	if ns := h.hubLoopWatchdogIntervalNanos.Load(); ns > 0 {
+		return time.Duration(ns)
+	}
+	return defaultHubLoopWatchdogInterval
+}
+
+func (h *Hub) getHubLoopWatchdogCheckInterval() time.Duration {
+	threshold := h.getHubLoopWatchdogStallThreshold()
+	if threshold <= time.Second {
+		if threshold < 10*time.Millisecond {
+			return 5 * time.Millisecond
+		}
+		return threshold / 2
+	}
+	return time.Second
+}
+
+func (h *Hub) checkHubLoopWatchdog() {
+	last := h.hubLoopLastTick.Load()
+	if last == 0 {
+		return
+	}
+
+	threshold := h.getHubLoopWatchdogStallThreshold()
+	if time.Since(time.Unix(0, last)) <= threshold {
+		return
+	}
+	if h.hubLoopWatchdogTriggered.Swap(true) {
+		return
+	}
+
+	buf := make([]byte, 64*1024)
+	n := runtime.Stack(buf, true)
+	h.logger.Printf("hub loop stalled (>=%s since last tick), goroutine stacks:\n%s", threshold, buf[:n])
+}
+
+func (h *Hub) hubLoopWaitIfStalled() {
+	for {
+		h.hubLoopStallMu.Lock()
+		stalled := h.hubLoopStallRelease != nil
+		ch := h.hubLoopStallRelease
+		h.hubLoopStallMu.Unlock()
+		if !stalled {
+			return
+		}
+		<-ch
+	}
+}
+
+func (h *Hub) sendRoomUpdated(message *talk.BackendServerRoomRequest) {
+	select {
+	case h.roomUpdated <- message:
+	default:
+	}
+}
+
+func (h *Hub) sendRoomDeleted(message *talk.BackendServerRoomRequest) {
+	select {
+	case h.roomDeleted <- message:
+	default:
+	}
+}
+
+func (h *Hub) sendRoomInCall(message *talk.BackendServerRoomRequest) {
+	select {
+	case h.roomInCall <- message:
+	default:
+		h.roomInCallDrops.Add(1)
+	}
+}
+
+func (h *Hub) sendRoomParticipants(message *talk.BackendServerRoomRequest) {
+	select {
+	case h.roomParticipants <- message:
+	default:
 	}
 }
 

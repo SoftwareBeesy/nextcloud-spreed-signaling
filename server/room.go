@@ -289,14 +289,14 @@ func (r *Room) processBackendRoomRequestRoom(message *talk.BackendServerRoomRequ
 	message.Backend = r.Backend()
 	switch message.Type {
 	case "update":
-		r.hub.roomUpdated <- message
+		r.hub.sendRoomUpdated(message)
 	case "delete":
 		r.notifyInternalRoomDeleted()
-		r.hub.roomDeleted <- message
+		r.hub.sendRoomDeleted(message)
 	case "incall":
-		r.hub.roomInCall <- message
+		r.hub.sendRoomInCall(message)
 	case "participants":
-		r.hub.roomParticipants <- message
+		r.hub.sendRoomParticipants(message)
 	case "message":
 		r.publishRoomMessage(message.Message)
 	case "switchto":
@@ -526,6 +526,26 @@ func (r *Room) addSessionToCall(session Session) bool {
 	return r.addSessionToCallLocked(session)
 }
 
+// sessionUserIdLocked returns the user id for eviction checks while r.mu is write-locked.
+// Must not call Session.UserId() here: ClientSession.UserId may call GetRoomSessionData (RLock)
+// and self-deadlock on the same room mutex (ISSUE-262 / INC-2026-08-31-001).
+func (r *Room) sessionUserIdLocked(session Session) string {
+	if clientSession, ok := session.(*ClientSession); ok {
+		if userId := clientSession.AuthUserId(); userId != "" {
+			return userId
+		}
+	}
+	if authUser, ok := session.(interface{ AuthUserId() string }); ok {
+		if userId := authUser.AuthUserId(); userId != "" {
+			return userId
+		}
+	}
+	if data := r.roomSessionData[session.PublicId()]; data != nil {
+		return data.UserId
+	}
+	return ""
+}
+
 // sessionsToEvictForUser returns in-call sessions of the same authenticated user
 // that should be replaced. Guests (empty user id) are never returned.
 func (r *Room) sessionsToEvictForUser(newSession Session) []Session {
@@ -547,7 +567,7 @@ func (r *Room) sessionsToEvictForUser(newSession Session) []Session {
 		if existing.PublicId() == newSession.PublicId() {
 			continue
 		}
-		if existing.UserId() != userId {
+		if r.sessionUserIdLocked(existing) != userId {
 			continue
 		}
 		switch existing.ClientType() {

@@ -413,8 +413,6 @@ func (w *counterWriter) Write(p []byte) (int, error) {
 
 // +checklocks:c.mu
 func (c *Client) writeInternal(message json.Marshaler) bool {
-	var closeData []byte
-
 	c.conn.SetWriteDeadline(time.Now().Add(writeWait)) // nolint
 	writer, err := c.conn.NextWriter(websocket.TextMessage)
 	var written int
@@ -442,24 +440,14 @@ func (c *Client) writeInternal(message json.Marshaler) bool {
 		} else {
 			c.logger.Printf("Could not send message %+v to %s: %v", message, c.RemoteAddr(), err)
 		}
-		closeData = websocket.FormatCloseMessage(websocket.CloseInternalServerErr, "")
-		goto close
+		// Dead peer — close so hub unregisters session (INC-2026-08-31-001).
+		go c.Close()
+		return false
 	}
 
 	statsClientBytesTotal.WithLabelValues("outgoing").Add(float64(written))
 	statsClientMessagesTotal.WithLabelValues("outgoing").Inc()
 	return true
-
-close:
-	c.conn.SetWriteDeadline(time.Now().Add(writeWait)) // nolint
-	if err := c.conn.WriteMessage(websocket.CloseMessage, closeData); err != nil {
-		if sessionId := c.GetSessionId(); sessionId != "" {
-			c.logger.Printf("Could not send close message to client %s: %v", sessionId, err)
-		} else {
-			c.logger.Printf("Could not send close message to %s: %v", c.RemoteAddr(), err)
-		}
-	}
-	return false
 }
 
 func (c *Client) writeMessage(message WritableClientMessage) bool {
@@ -520,11 +508,15 @@ func (c *Client) WritePump() {
 	}()
 
 	// Fetch initial RTT before any messages have been sent to the client.
-	c.sendPing()
+	if !c.sendPing() {
+		c.Close()
+		return
+	}
 	for {
 		select {
 		case <-ticker.C:
 			if !c.sendPing() {
+				c.Close()
 				return
 			}
 		case <-c.closer.C:
